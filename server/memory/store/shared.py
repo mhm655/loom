@@ -200,6 +200,25 @@ async def tombstone_shared_embedding(
     )
 
 
+async def newest_shared_vector_version(
+    org: str, namespace: str, memory_key: str, *, ch: _CHClient | None = None
+) -> int:
+    """The newest version among the key's scope='shared' vectors, a retired one included,
+    read strongly; 0 when it has none."""
+    ch = ch or _default_client()
+    row = await ch.query_one(
+        """
+        SELECT max(version) AS version FROM loom.memory_embeddings
+        WHERE org = {org:String} AND namespace = {ns:String} AND agent = {agent:String}
+          AND user_id = '-' AND session_id = '-' AND scope = 'shared'
+          AND memory_key = {memory_key:String}
+        """
+        + _SEQUENTIAL,
+        params={"org": org, "ns": namespace, "agent": SHARED_AGENT, "memory_key": memory_key},
+    )
+    return int(row["version"]) if row else 0
+
+
 async def shared_definitions(
     org: str, namespace: str, limit: int, *, ch: _CHClient | None = None
 ) -> list[dict[str, Any]]:

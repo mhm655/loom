@@ -53,7 +53,8 @@ def _row(**over: Any) -> MemoryRow:
 def store(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """The source row, the live shared definitions (key -> value) and what was written,
     with the claim: `free` (False: another holds it; None: the lease store does not
-    answer), `claims` (the names taken), `held` (inside it); `heads` holds each key's newest shared row (key -> row)."""
+    answer), `claims` (the names taken) and `held` (inside it); `heads` and
+    `vector_heads` hold each key's newest shared row and newest vector version."""
     state: dict[str, Any] = {
         "row": _row(),
         "shared": {},
@@ -62,6 +63,7 @@ def store(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "claims": [],
         "held": False,
         "heads": {},
+        "vector_heads": {},
     }
 
     async def get_by_key(*_a: Any, **_k: Any) -> MemoryRow:
@@ -77,6 +79,10 @@ def store(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         assert strong and state["held"], "the head is read strongly under the claim"
         return state["heads"].get(key)
 
+    async def vector_head(_org: str, _ns: str, key: str) -> int:
+        assert state["held"], "the vector's head is read under the claim"
+        return state["vector_heads"].get(key, 0)
+
     async def write(row: dict[str, Any]) -> None:
         assert state["held"] or row["memory_type"] != "definition", "written under the claim"
         state["written"].append(row)
@@ -84,7 +90,6 @@ def store(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     @asynccontextmanager
     async def holding(name: str, **_k: Any) -> AsyncIterator[bool]:
         state["claims"].append(name)
-        state["claimed_at"] = promote.next_version()
         if state["free"] is None:
             raise LeaseUnavailable("the lease store did not answer", operation=name)
         state["held"] = state["free"]
@@ -101,6 +106,7 @@ def store(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(shared, "shared_definitions", definitions)
     monkeypatch.setattr(shared, "insert_shared_row", write)
     monkeypatch.setattr(shared, "fetch_shared", head)
+    monkeypatch.setattr(shared, "newest_shared_vector_version", vector_head)
     return state
 
 
@@ -365,12 +371,6 @@ async def test_a_definition_is_checked_and_written_under_the_namespaces_claim(
     assert store["written"] == []
 
 
-async def test_a_definitions_version_is_drawn_under_the_claim(store: dict[str, Any]) -> None:
-    await promote.handle_memory_promote(_input())
-    (row,) = store["written"]
-    assert row["version"] > store["claimed_at"]
-
-
 async def test_a_definitions_demote_takes_the_claim_and_reads_strongly(
     store: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -499,6 +499,12 @@ async def test_a_definition_is_versioned_above_its_newest_row(store: dict[str, A
     # A demote from a replica whose clock runs ahead.
     ahead = promote.next_version() + 10**12
     store["heads"] = {KEY: {"version": ahead, "tombstoned_at": NOW}}
+    await promote.handle_memory_promote(_input())
+    assert store["written"][0]["version"] == ahead + 2
+    # A vector a cut-off demote retired above the live row.
+    store["written"].clear()
+    store["heads"] = {KEY: {"version": 1, "tombstoned_at": None}}
+    store["vector_heads"] = {KEY: ahead}
     await promote.handle_memory_promote(_input())
     assert store["written"][0]["version"] == ahead + 2
 

@@ -403,3 +403,42 @@ async def test_an_mcp_agent_promotes_a_definition_as_its_description_says(
     got = await call("loom_memory_get", row)
     out = await call("loom_memory_promote", {**row, "approved_sha256": got["content_sha256"]})
     assert out["shared_memory_key"] == "definition/arr"
+
+
+@pytest.mark.asyncio
+async def test_a_promotion_racing_a_demote_leaves_the_row_and_its_vector_agreeing(
+    control_plane_url: str, mint_test_token, ch_client
+) -> None:
+    """Through the server: a definition's revision and its demote sent at once leave its
+    shared row and its shared vector both live or both retired."""
+    from loom import Agent
+
+    from tests.integration._resources import unique_org
+
+    org, ns = unique_org("definition-demote-race"), f"def-{uuid.uuid4().hex[:8]}"
+    tok = mint_test_token(org=org, namespaces=["*"], roles=["admin", "writer"], subject="definer")
+    key = "definition/arr"
+    async with Agent(
+        org=org, namespace=ns, agent="detector", base_url=control_plane_url, api_key=tok
+    ) as a:
+        for body in ("Annual recurring revenue.", "Yearly recurring revenue."):
+            await a.memory.set(key, {"term": "ARR", "body": body}, "definition", agent_id="-")
+            got = await a.memory.get(key, agent_id="-")
+            promote = a.memory.promote(key, agent_id="-", approved_sha256=got["content_sha256"])
+            if body.startswith("Annual"):
+                await promote
+            else:
+                await asyncio.gather(promote, a.memory.demote(key), return_exceptions=True)
+    params = {"org": org, "ns": ns, "k": key}
+    live_row = ch_client.query(
+        "SELECT tombstoned_at IS NULL FROM loom.shared FINAL"
+        " WHERE org = {org:String} AND namespace = {ns:String} AND memory_key = {k:String}",
+        parameters=params,
+    ).result_rows[0][0]
+    vectors = ch_client.query(
+        "SELECT countIf(tombstoned_at IS NULL), count() FROM loom.memory_embeddings FINAL"
+        " WHERE org = {org:String} AND namespace = {ns:String} AND scope = 'shared'"
+        " AND memory_key = {k:String}",
+        parameters=params,
+    ).result_rows[0]
+    assert vectors[1] and bool(vectors[0]) == bool(live_row), (live_row, vectors)

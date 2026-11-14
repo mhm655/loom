@@ -25,6 +25,7 @@ from server.core.errors import (
 )
 from server.core.hashing import served_content_sha256
 from server.embedding import get_embedder
+from server.embedding.embedder import Embedder
 from server.identity.app.request_scope import request_scope
 from server.memory.api.models_lifecycle import (
     MemoryDemoteInput,
@@ -47,7 +48,7 @@ from server.memory.domain.memory_types import (
 from server.memory.domain.sensitivity import HIGH, MEDIUM, max_sensitivity
 from server.memory.domain.trust import verification_state
 from server.memory.store import shared as shared_repo
-from server.memory.store.rows import MemoryRow, next_version
+from server.memory.store.rows import MemoryRow, next_version, version_over
 from server.observability.budget_shape import note_budget_shape
 from server.settings import settings
 
@@ -185,9 +186,10 @@ async def handle_memory_promote(input: MemoryPromoteInput) -> MemoryPromoteOutpu
     if is_definition_promotion:
         await _write_definition(input.org, input.namespace, names, row, vector_row)
     else:
-        await shared_repo.insert_shared_row({**row, "version": next_version()})
+        version = next_version()
+        await shared_repo.insert_shared_row({**row, "version": version})
         if vector_row is not None:
-            await shared_repo.insert_shared_embedding(vector_row)
+            await shared_repo.insert_shared_embedding({**vector_row, "version": version})
 
     return MemoryPromoteOutput(
         shared_memory_key=target_key,
@@ -291,7 +293,7 @@ def _shared_vector_row(
     src: MemoryRow,
     target_key: str,
     excerpt: str,
-    embedder: Any,
+    embedder: Embedder,
     embedding: list[float],
     created_at: datetime,
 ) -> dict[str, Any]:
@@ -335,20 +337,16 @@ async def _write_definition(
     ceiling or another shared definition holds one of its names, under the namespace's
     claim: of a definition's promotions and demotes, the last to run decides."""
     async with _definition_claim(org, namespace):
-        await _check_shared_definitions(org, namespace, names, row["memory_key"])
-        head = await shared_repo.fetch_shared(org, namespace, row["memory_key"], strong=True)
-        version = _version_above(head)
+        key = row["memory_key"]
+        await _check_shared_definitions(org, namespace, names, key)
+        # Above the row and the vector: a demote cut off between the two left a retired
+        # vector above the live row.
+        head = await shared_repo.fetch_shared(org, namespace, key, strong=True)
+        vector = await shared_repo.newest_shared_vector_version(org, namespace, key)
+        version = version_over(max(int(head["version"]) if head else 0, vector))
         await shared_repo.insert_shared_row({**row, "version": version})
         if vector_row is not None:
             await shared_repo.insert_shared_embedding({**vector_row, "version": version})
-
-
-def _version_above(head: dict[str, Any] | None) -> int:
-    """A version above the key's newest row, a demote's included, whatever the clock of
-    the replica that wrote it (two above, as `version_over` draws)."""
-    if head is None:
-        return next_version()
-    return max(next_version(), int(head["version"]) + 2)
 
 
 @asynccontextmanager
@@ -416,7 +414,7 @@ async def _demote(input: MemoryDemoteInput, *, strong: bool = False) -> MemoryDe
 
     # The tombstone's version, above the row's whatever the clock that wrote it; the vector
     # retire carries it.
-    version = _version_above(row)
+    version = version_over(int(row["version"]))
     # The vector first: a demote cut off between the two finds the row live when it is
     # sent again, and does both.
     await shared_repo.tombstone_shared_embedding(
