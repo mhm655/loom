@@ -342,11 +342,19 @@ async def _write_definition(
         # Above the row and the vector: a demote cut off between the two left a retired
         # vector above the live row.
         head = await shared_repo.fetch_shared(org, namespace, key, strong=True)
-        vector = await shared_repo.newest_shared_vector_version(org, namespace, key)
-        version = version_over(max(int(head["version"]) if head else 0, vector))
+        version = await _definition_version(org, namespace, key, head)
         await shared_repo.insert_shared_row({**row, "version": version})
         if vector_row is not None:
             await shared_repo.insert_shared_embedding({**vector_row, "version": version})
+
+
+async def _definition_version(
+    org: str, namespace: str, key: str, head: dict[str, Any] | None
+) -> int:
+    """Two above the key's newest shared row (`head`) and newest shared vector, whatever
+    the clocks that wrote them."""
+    vector = await shared_repo.newest_shared_vector_version(org, namespace, key)
+    return version_over(max(int(head["version"]) if head else 0, vector))
 
 
 @asynccontextmanager
@@ -412,9 +420,12 @@ async def _demote(input: MemoryDemoteInput, *, strong: bool = False) -> MemoryDe
     now_naive = naive_utc_now()
     was_reversible = bool(row["reversible_until"]) and row["reversible_until"] >= now_naive
 
-    # The tombstone's version, above the row's whatever the clock that wrote it; the vector
-    # retire carries it.
-    version = version_over(int(row["version"]))
+    # The tombstone's version, which the vector retire carries: above the row's whatever
+    # the clock that wrote it, and for a definition above its vector's too.
+    if strong:
+        version = await _definition_version(input.org, input.namespace, input.memory_key, row)
+    else:
+        version = version_over(int(row["version"]))
     # The vector first: a demote cut off between the two finds the row live when it is
     # sent again, and does both.
     await shared_repo.tombstone_shared_embedding(
@@ -423,6 +434,7 @@ async def _demote(input: MemoryDemoteInput, *, strong: bool = False) -> MemoryDe
         input.memory_key,
         now_naive,
         version=version,
+        strong=strong,
     )
     # Tombstone via higher-version INSERT, mirroring every live column except
     # tombstoned_at + version (omitting any column zeros it for FINAL readers).

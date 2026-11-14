@@ -413,7 +413,8 @@ async def test_a_cut_off_demote_sent_again_retires_the_vector_and_the_row(
     store["heads"] = {KEY: live}
     steps: list[tuple[str, int]] = []
 
-    async def retire(*_a: Any, version: int, **_k: Any) -> None:
+    async def retire(*_a: Any, version: int, strong: bool, **_k: Any) -> None:
+        assert strong, "the live vectors are read strongly"
         steps.append(("vector", version))
 
     async def tombstone(row: dict[str, Any]) -> None:
@@ -431,6 +432,28 @@ async def test_a_cut_off_demote_sent_again_retires_the_vector_and_the_row(
     assert out.demoted
     assert [s for s, _ in steps] == ["vector", "vector", "row"]
     assert all(v >= ahead + 2 for _, v in steps)
+
+
+async def test_another_rows_vector_shares_its_rows_version(
+    store: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from server.memory.app import conflicts
+
+    vectors: list[dict[str, Any]] = []
+
+    async def vector(row: dict[str, Any]) -> None:
+        vectors.append(row)
+
+    async def no_peers(**_k: Any) -> list[dict[str, Any]]:
+        return []
+
+    monkeypatch.setattr(promote, "get_embedder", lambda: _Embedder())
+    monkeypatch.setattr(conflicts, "check_against_shared", no_peers)
+    monkeypatch.setattr(shared, "insert_shared_embedding", vector)
+    store["row"] = _row(memory_type="semantic", memory_key="arr_note", agent="bot")
+    await promote.handle_memory_promote(_input(memory_key="arr_note", agent="bot"))
+    (row,) = store["written"]
+    assert [v["version"] for v in vectors] == [row["version"]]
 
 
 async def test_another_row_keeps_the_old_promotion_rules(store: dict[str, Any]) -> None:
@@ -495,7 +518,9 @@ async def test_a_claim_that_runs_out_is_repaired_by_sending_the_promotion_again(
     assert len(store["written"]) == 2 and embedded == [(KEY, store["written"][1]["version"])]
 
 
-async def test_a_definition_is_versioned_above_its_newest_row(store: dict[str, Any]) -> None:
+async def test_a_definition_is_versioned_above_its_newest_row_and_vector(
+    store: dict[str, Any],
+) -> None:
     # A demote from a replica whose clock runs ahead.
     ahead = promote.next_version() + 10**12
     store["heads"] = {KEY: {"version": ahead, "tombstoned_at": NOW}}

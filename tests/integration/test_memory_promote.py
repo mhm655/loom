@@ -421,14 +421,22 @@ async def test_a_promotion_racing_a_demote_leaves_the_row_and_its_vector_agreein
     async with Agent(
         org=org, namespace=ns, agent="detector", base_url=control_plane_url, api_key=tok
     ) as a:
-        for body in ("Annual recurring revenue.", "Yearly recurring revenue."):
+
+        async def approved(body: str) -> str:
             await a.memory.set(key, {"term": "ARR", "body": body}, "definition", agent_id="-")
-            got = await a.memory.get(key, agent_id="-")
-            promote = a.memory.promote(key, agent_id="-", approved_sha256=got["content_sha256"])
-            if body.startswith("Annual"):
-                await promote
-            else:
-                await asyncio.gather(promote, a.memory.demote(key), return_exceptions=True)
+            return (await a.memory.get(key, agent_id="-"))["content_sha256"]
+
+        first = await approved("Annual recurring revenue.")
+        await a.memory.promote(key, agent_id="-", approved_sha256=first)
+        revision = await approved("Yearly recurring revenue.")
+        results = await asyncio.gather(
+            a.memory.promote(key, agent_id="-", approved_sha256=revision),
+            a.memory.demote(key),
+            return_exceptions=True,
+        )
+    # Each answered, or found the other holding the namespace.
+    for r in results:
+        assert not isinstance(r, Exception) or getattr(r, "code", "") == "OVERLOADED", r
     params = {"org": org, "ns": ns, "k": key}
     live_row = ch_client.query(
         "SELECT tombstoned_at IS NULL FROM loom.shared FINAL"

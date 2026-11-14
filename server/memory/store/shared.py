@@ -182,6 +182,7 @@ async def tombstone_shared_embedding(
     when: datetime,
     *,
     version: int,
+    strong: bool = False,
     ch: _CHClient | None = None,
 ) -> None:
     """Mark the scope='shared' embedding tombstoned so memory.search
@@ -191,12 +192,12 @@ async def tombstone_shared_embedding(
     an ALTER UPDATE: a mutation rewrites parts through Keeper, and any
     UPDATE on the vector table costs the fact leg its codes-first read. The
     insert is committed, so demote's contract holds: a read after demote sees
-    the absence."""
+    the absence. `strong` reads the live vectors strongly."""
     import server.memory.store as memory_repo
 
     ch = ch or _default_client()
     await memory_repo.reemit_shared_embedding_rows(
-        org, namespace, memory_key, ch=ch, tombstoned_at=when, version=int(version)
+        org, namespace, memory_key, ch=ch, strong=strong, tombstoned_at=when, version=int(version)
     )
 
 
