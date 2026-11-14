@@ -351,8 +351,8 @@ async def _write_definition(
 async def _definition_version(
     org: str, namespace: str, key: str, head: dict[str, Any] | None
 ) -> int:
-    """Two above the key's newest shared row (`head`) and newest shared vector, whatever
-    the clocks that wrote them."""
+    """At least two above the key's newest shared row (`head`) and newest shared vector,
+    whatever the clocks that wrote them."""
     vector = await shared_repo.newest_shared_vector_version(org, namespace, key)
     return version_over(max(int(head["version"]) if head else 0, vector))
 
