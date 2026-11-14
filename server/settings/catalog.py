@@ -6439,11 +6439,13 @@ OP_SHAPE_BUDGETS_P99_MS: dict[str, dict[str, int]] = {
     "memory.bulk_set": {"webhook": 350},
     "memory.delete": {"webhook": 80},
     "memory.delete_version": {"webhook": 130},
+    # "definition": the namespace's claim around a definition's strong read and writes.
+    "memory.demote": {"definition": 150},
     "memory.evidence": {"audited": 200},
     "memory.get": {"audited": 75},
     "memory.get_by_id": {"audited": 100},
     "memory.history": {"audited": 130},
-    # "definition": the namespace's claim around the name check and the insert.
+    # "definition": the namespace's claim around the name check and the writes.
     "memory.promote": {"definition": 150},
     "memory.restore": {"undo": 130, "webhook": 130},
     "memory.update": {"webhook": 220},

@@ -19,6 +19,7 @@ from server.core.repo_base import _CHClient, _default_client
 from server.core.rmt_carry import register
 from server.memory.domain.definitions import DEFINITION_KEY_PREFIX
 from server.memory.domain.memory_types import DEFINITION
+from server.memory.store.sql import _SEQUENTIAL
 
 # The agent of a promoted row's embedding: shared rows are not agent-scoped.
 SHARED_AGENT = "_shared"
@@ -116,13 +117,13 @@ async def fetch_shared(
         """
         SELECT value, memory_type, confidence, promoted_from, promotion_event,
                promoted_from_candidate_id,
-               promoted_by, rationale, promoted_at, reversible_until, tombstoned_at
+               promoted_by, rationale, promoted_at, reversible_until, tombstoned_at, version
         FROM loom.shared FINAL
         WHERE org = {org:String} AND namespace = {ns:String}
           AND memory_key = {memory_key:String}
         LIMIT 1
         """
-        + ("SETTINGS select_sequential_consistency = 1" if strong else ""),
+        + (_SEQUENTIAL if strong else ""),
         params={"org": org, "ns": namespace, "memory_key": memory_key},
     )
 
@@ -220,8 +221,8 @@ async def shared_definitions(
           AND tombstoned_at IS NULL
         ORDER BY memory_key
         LIMIT {lim:UInt32}
-        SETTINGS select_sequential_consistency = 1
-        """,
+        """
+        + _SEQUENTIAL,
         params={
             "org": org,
             "ns": namespace,

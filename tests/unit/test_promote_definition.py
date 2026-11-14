@@ -53,8 +53,7 @@ def _row(**over: Any) -> MemoryRow:
 def store(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """The source row, the live shared definitions (key -> value) and what was written,
     with the claim: `free` (False: another holds it; None: the lease store does not
-    answer), `claims` (the names taken), `held` (inside it), `expire` (it runs out on
-    exit)."""
+    answer), `claims` (the names taken), `held` (inside it); `heads` holds each key's newest shared row (key -> row)."""
     state: dict[str, Any] = {
         "row": _row(),
         "shared": {},
@@ -62,7 +61,7 @@ def store(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "free": True,
         "claims": [],
         "held": False,
-        "expire": False,
+        "heads": {},
     }
 
     async def get_by_key(*_a: Any, **_k: Any) -> MemoryRow:
@@ -73,6 +72,10 @@ def store(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         assert state["held"], "the check runs under the namespace's claim"
         rows = [{"memory_key": k, **_extracted(v)} for k, v in sorted(state["shared"].items())]
         return rows[:limit]
+
+    async def head(_org: str, _ns: str, key: str, *, strong: bool = False) -> Any:
+        assert strong and state["held"], "the head is read strongly under the claim"
+        return state["heads"].get(key)
 
     async def write(row: dict[str, Any]) -> None:
         assert state["held"] or row["memory_type"] != "definition", "written under the claim"
@@ -89,8 +92,6 @@ def store(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
             yield state["free"]
         finally:
             state["held"] = False
-        if state["expire"]:
-            raise ClaimExpired(f"the work under claim {name} did not finish in time")
 
     monkeypatch.setattr(memory_repo, "get_by_key", get_by_key)
     monkeypatch.setattr(promote, "get_embedder", lambda: None)
@@ -99,6 +100,7 @@ def store(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(promote.leases, "holding", holding)
     monkeypatch.setattr(shared, "shared_definitions", definitions)
     monkeypatch.setattr(shared, "insert_shared_row", write)
+    monkeypatch.setattr(shared, "fetch_shared", head)
     return state
 
 
@@ -381,9 +383,54 @@ async def test_a_definitions_demote_takes_the_claim_and_reads_strongly(
 
     monkeypatch.setattr(shared, "fetch_shared", fetch)
     for key in (KEY, "arr_note"):
-        await promote.handle_memory_demote(MemoryDemoteInput(org="o", namespace="n", memory_key=key))
+        await promote.handle_memory_demote(
+            MemoryDemoteInput(org="o", namespace="n", memory_key=key)
+        )
     assert seen == [(KEY, True, True), ("arr_note", False, False)]
     assert store["claims"] == ["definition.promote/o/n"]
+
+
+async def test_a_cut_off_demote_sent_again_retires_the_vector_and_the_row(
+    store: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from server.memory.api.models_lifecycle import MemoryDemoteInput
+
+    ahead = promote.next_version() + 10**12
+    live = {
+        "value": json.dumps(VALUE),
+        "memory_type": "definition",
+        "confidence": 1.0,
+        "promoted_from": [],
+        "promotion_event": "e",
+        "promoted_from_candidate_id": None,
+        "promoted_by": "user:admin",
+        "rationale": "",
+        "promoted_at": NOW,
+        "reversible_until": None,
+        "tombstoned_at": None,
+        "version": ahead,
+    }
+    store["heads"] = {KEY: live}
+    steps: list[tuple[str, int]] = []
+
+    async def retire(*_a: Any, version: int, **_k: Any) -> None:
+        steps.append(("vector", version))
+
+    async def tombstone(row: dict[str, Any]) -> None:
+        if len(steps) == 1:
+            raise ClaimExpired("the work under the claim did not finish in time")
+        steps.append(("row", row["version"]))
+
+    monkeypatch.setattr(shared, "tombstone_shared_embedding", retire)
+    monkeypatch.setattr(shared, "insert_shared_row", tombstone)
+    demote = MemoryDemoteInput(org="o", namespace="n", memory_key=KEY)
+    with pytest.raises(ClaimExpired):
+        await promote.handle_memory_demote(demote)
+    # The row is still live, so the demote sent again does both, above the row's version.
+    out = await promote.handle_memory_demote(demote)
+    assert out.demoted
+    assert [s for s, _ in steps] == ["vector", "vector", "row"]
+    assert all(v >= ahead + 2 for _, v in steps)
 
 
 async def test_another_row_keeps_the_old_promotion_rules(store: dict[str, Any]) -> None:
@@ -424,22 +471,36 @@ async def test_a_definition_skips_the_close_shared_row_check(
 async def test_a_claim_that_runs_out_is_repaired_by_sending_the_promotion_again(
     store: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    embedded: list[str] = []
+    embedded: list[tuple[str, int]] = []
+    cut_off = False
 
     async def embedding(row: dict[str, Any]) -> None:
-        embedded.append(row["memory_key"])
+        assert store["held"], "the vector is written under the claim"
+        if cut_off:
+            raise ClaimExpired("the work under the claim did not finish in time")
+        embedded.append((row["memory_key"], row["version"]))
 
     monkeypatch.setattr(promote, "get_embedder", lambda: _Embedder())
     monkeypatch.setattr(shared, "insert_shared_embedding", embedding)
-    store["expire"] = True
+    # Cut off between the shared row and its vector.
+    cut_off = True
     with pytest.raises(ClaimExpired):
         await promote.handle_memory_promote(_input())
     assert len(store["written"]) == 1 and embedded == []
-    # The second promotion is a revision of the same key, and writes both.
-    store["expire"] = False
+    # The second promotion is a revision of the same key, and writes both at one version.
+    cut_off = False
     store["shared"] = {KEY: VALUE}
+    store["heads"] = {KEY: store["written"][0]}
     await promote.handle_memory_promote(_input())
-    assert len(store["written"]) == 2 and embedded == [KEY]
+    assert len(store["written"]) == 2 and embedded == [(KEY, store["written"][1]["version"])]
+
+
+async def test_a_definition_is_versioned_above_its_newest_row(store: dict[str, Any]) -> None:
+    # A demote from a replica whose clock runs ahead.
+    ahead = promote.next_version() + 10**12
+    store["heads"] = {KEY: {"version": ahead, "tombstoned_at": NOW}}
+    await promote.handle_memory_promote(_input())
+    assert store["written"][0]["version"] == ahead + 2
 
 
 @pytest.fixture

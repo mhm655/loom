@@ -7,7 +7,7 @@ import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from fastapi import HTTPException
@@ -80,39 +80,7 @@ async def handle_memory_promote(input: MemoryPromoteInput) -> MemoryPromoteOutpu
             },
         )
 
-    # Block rows are per-agent working memory; loom.shared has no char_limit,
-    # so promoting one would silently drop its overflow cap. Refuse.
-    if src.memory_type == "profile":
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "code": "BLOCK_PROMOTION_REFUSED",
-                "message": (
-                    "memory.promote refuses block rows — blocks are "
-                    "per-agent working memory and loom.shared doesn't "
-                    "carry char_limit. If you need a team-wide persona, "
-                    "have each agent write its own block; cross-agent "
-                    "shared blocks is a separate primitive that doesn't "
-                    "exist yet."
-                ),
-            },
-        )
-
-    # A 'high' row is kept out of every search leg by having no vector; loom.shared has
-    # no sensitivity column, so a promoted copy would be embedded and served to the
-    # whole namespace. Refuse.
-    if (getattr(src, "sensitivity", "") or "") == "high":
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "code": "HIGH_SENSITIVITY_PROMOTION_REFUSED",
-                "message": (
-                    "memory.promote refuses rows labelled sensitivity='high': "
-                    "shared memory carries no sensitivity label and is searchable "
-                    "namespace-wide."
-                ),
-            },
-        )
+    _refuse_unshareable(src)
 
     target_key = input.target_key or input.memory_key
     is_definition_promotion = is_definition(src) or target_key.startswith(DEFINITION_KEY_PREFIX)
@@ -207,42 +175,19 @@ async def handle_memory_promote(input: MemoryPromoteInput) -> MemoryPromoteOutpu
         "superseded_by": None,
         "tombstoned_at": None,
     }
+    # The scope='shared' embedding, reusing the vector above (or a stub the
+    # embedding_worker reconciles), so memory.search(scope='shared') finds it.
+    vector_row = (
+        None
+        if embedder is None
+        else _shared_vector_row(src, target_key, excerpt, embedder, embedding, now_naive)
+    )
     if is_definition_promotion:
-        await _insert_definition(input.org, input.namespace, names, row)
+        await _write_definition(input.org, input.namespace, names, row, vector_row)
     else:
         await shared_repo.insert_shared_row({**row, "version": next_version()})
-
-    # Make the shared memory searchable via a scope='shared' embedding,
-    # reusing the vector above (or a stub the embedding_worker reconciles).
-    if embedder is not None:
-        await shared_repo.insert_shared_embedding(
-            {
-                "org": input.org,
-                "namespace": input.namespace,
-                "agent": shared_repo.SHARED_AGENT,
-                "user_id": "-",
-                "session_id": "-",
-                "memory_key": target_key,
-                "memory_type": src.memory_type,
-                "scope": "shared",
-                "content_excerpt": excerpt,
-                "embedding_model": embedder.model_name,
-                "embedding_dim": embedder.dim if embedding else 0,
-                "embedding": embedding,  # [] when embed failed
-                "confidence": float(src.confidence),
-                "tombstoned_at": None,
-                "created_at": now_naive,
-                "valid_at": src.valid_at,
-                # Provenance of the promoted content, for the ranking term and
-                # memory.ask's unverified-external filter; the attestation
-                # counts only while it binds the promoted content's hash.
-                "source_class": src.source_class,
-                "verified": int(
-                    verification_state(src.verified_by, src.verified_sha256, src.content_sha256)
-                    in ("human", "process")
-                ),
-            }
-        )
+        if vector_row is not None:
+            await shared_repo.insert_shared_embedding(vector_row)
 
     return MemoryPromoteOutput(
         shared_memory_key=target_key,
@@ -305,17 +250,105 @@ async def _approved_definition_names(
     return names
 
 
-async def _insert_definition(
-    org: str, namespace: str, names: set[str], row: dict[str, Any]
+def _refuse_unshareable(src: MemoryRow) -> None:
+    """Refuse a row the shared layer cannot carry: a block row or a 'high' one."""
+    # Block rows are per-agent working memory; loom.shared has no char_limit,
+    # so promoting one would silently drop its overflow cap. Refuse.
+    if src.memory_type == "profile":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "BLOCK_PROMOTION_REFUSED",
+                "message": (
+                    "memory.promote refuses block rows — blocks are "
+                    "per-agent working memory and loom.shared doesn't "
+                    "carry char_limit. If you need a team-wide persona, "
+                    "have each agent write its own block; cross-agent "
+                    "shared blocks is a separate primitive that doesn't "
+                    "exist yet."
+                ),
+            },
+        )
+
+    # A 'high' row is kept out of every search leg by having no vector; loom.shared has
+    # no sensitivity column, so a promoted copy would be embedded and served to the
+    # whole namespace. Refuse.
+    if (getattr(src, "sensitivity", "") or "") == "high":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "HIGH_SENSITIVITY_PROMOTION_REFUSED",
+                "message": (
+                    "memory.promote refuses rows labelled sensitivity='high': "
+                    "shared memory carries no sensitivity label and is searchable "
+                    "namespace-wide."
+                ),
+            },
+        )
+
+
+def _shared_vector_row(
+    src: MemoryRow,
+    target_key: str,
+    excerpt: str,
+    embedder: Any,
+    embedding: list[float],
+    created_at: datetime,
+) -> dict[str, Any]:
+    """The scope='shared' embedding row of `src` promoted to `target_key`."""
+    return {
+        "org": src.org,
+        "namespace": src.namespace,
+        "agent": shared_repo.SHARED_AGENT,
+        "user_id": "-",
+        "session_id": "-",
+        "memory_key": target_key,
+        "memory_type": src.memory_type,
+        "scope": "shared",
+        "content_excerpt": excerpt,
+        "embedding_model": embedder.model_name,
+        "embedding_dim": embedder.dim if embedding else 0,
+        "embedding": embedding,  # [] when embed failed
+        "confidence": float(src.confidence),
+        "tombstoned_at": None,
+        "created_at": created_at,
+        "valid_at": src.valid_at,
+        # Provenance of the promoted content, for the ranking term and
+        # memory.ask's unverified-external filter; the attestation
+        # counts only while it binds the promoted content's hash.
+        "source_class": src.source_class,
+        "verified": int(
+            verification_state(src.verified_by, src.verified_sha256, src.content_sha256)
+            in ("human", "process")
+        ),
+    }
+
+
+async def _write_definition(
+    org: str,
+    namespace: str,
+    names: set[str],
+    row: dict[str, Any],
+    vector_row: dict[str, Any] | None,
 ) -> None:
-    """Write the definition's shared row unless the namespace is at its ceiling or another
-    shared definition holds one of its names, under a claim on the namespace so that two
-    promotions cannot both pass."""
+    """Write the definition's shared row and its vector unless the namespace is at its
+    ceiling or another shared definition holds one of its names, under the namespace's
+    claim: of a definition's promotions and demotes, the last to run decides."""
     async with _definition_claim(org, namespace):
         await _check_shared_definitions(org, namespace, names, row["memory_key"])
-        # Drawn under the claim, so of the promotions and demotes of a definition the one
-        # that ran last wins.
-        await shared_repo.insert_shared_row({**row, "version": next_version()})
+        head = await shared_repo.fetch_shared(org, namespace, row["memory_key"], strong=True)
+        version = _version_above(head)
+        await shared_repo.insert_shared_row({**row, "version": version})
+        if vector_row is not None:
+            await shared_repo.insert_shared_embedding({**vector_row, "version": version})
+
+
+def _version_above(head: dict[str, Any] | None) -> int:
+    """A version above the key's newest row, a demote's included, whatever the clock of
+    the replica that wrote it (two above, as `version_over` draws)."""
+    if head is None:
+        return next_version()
+    return max(next_version(), int(head["version"]) + 2)
 
 
 @asynccontextmanager
@@ -325,7 +358,9 @@ async def _definition_claim(org: str, namespace: str) -> AsyncIterator[None]:
     claim = f"definition.promote/{org}/{namespace}"
     async with leases.holding(claim, ttl_s=30, wait_s=10) as held:
         if not held:
-            raise OverloadedError("another definition promotion or demote is running here")
+            raise OverloadedError(
+                "another definition promotion or demote is running in this namespace"
+            )
         yield
 
 
@@ -363,6 +398,7 @@ async def handle_memory_demote(input: MemoryDemoteInput) -> MemoryDemoteOutput:
     if not input.memory_key.startswith(DEFINITION_KEY_PREFIX):
         return await _demote(input)
     # Under the promotions' claim, reading what a promotion before it wrote.
+    note_budget_shape("definition")
     async with _definition_claim(input.org, input.namespace):
         return await _demote(input, strong=True)
 
@@ -378,9 +414,20 @@ async def _demote(input: MemoryDemoteInput, *, strong: bool = False) -> MemoryDe
     now_naive = naive_utc_now()
     was_reversible = bool(row["reversible_until"]) and row["reversible_until"] >= now_naive
 
+    # The tombstone's version, above the row's whatever the clock that wrote it; the vector
+    # retire carries it.
+    version = _version_above(row)
+    # The vector first: a demote cut off between the two finds the row live when it is
+    # sent again, and does both.
+    await shared_repo.tombstone_shared_embedding(
+        input.org,
+        input.namespace,
+        input.memory_key,
+        now_naive,
+        version=version,
+    )
     # Tombstone via higher-version INSERT, mirroring every live column except
     # tombstoned_at + version (omitting any column zeros it for FINAL readers).
-    version = next_version()  # the tombstone's, which the vector retire carries
     await shared_repo.insert_shared_row(
         {
             "org": input.org,
@@ -400,15 +447,6 @@ async def _demote(input: MemoryDemoteInput, *, strong: bool = False) -> MemoryDe
             "tombstoned_at": now_naive,
             "version": version,
         }
-    )
-
-    # Tombstone the shared embedding so memory.search(scope='shared') stops returning it
-    await shared_repo.tombstone_shared_embedding(
-        input.org,
-        input.namespace,
-        input.memory_key,
-        now_naive,
-        version=version,
     )
 
     return MemoryDemoteOutput(

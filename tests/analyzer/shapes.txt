@@ -130,6 +130,7 @@
 0fdc18bb9750	SELECT memory_key, argMax(tombstoned_at IS NOT NULL, version) AS deleted, argMax(status, version) AS head_status, argMax(content_sha256, version) AS head_sha256, argMax(sensitivity, version) AS head_s
 0ff9c942958d	SELECT * FROM loom.code_chunks FINAL WHERE (org, namespace, embedding_model, path, chunk_id) IN {keys:Array(Tuple(String, String, String, String, String))} AND tombstoned_at IS NULL
 1030febb1e77	ALTER TABLE loom.chunks UPDATE doc_superseded_at = {now:DateTime} WHERE (org = {org:String} AND user_id = {uid:String} AND doc_superseded_at IS NULL) AND ({erasure_mutation_tag:String} = {erasure_muta
+1032019497c6	SELECT value, memory_type, confidence, promoted_from, promotion_event, promoted_from_candidate_id, promoted_by, rationale, promoted_at, reversible_until, tombstoned_at, version FROM loom.shared FINAL
 1036d9982eb4	SELECT concat(?, c.session_id, ?, toString(c.chunk_index)) AS memory_key, ? AS memory_type, c.content AS content_excerpt, toString(ss.session_date) AS created_at, toString(ss.session_date) AS valid_at
 107be5b763da	SELECT count() AS n FROM loom.memory_categories FINAL WHERE org = {org:String} AND namespace IN {ns:Array(String)} AND tombstoned_at IS NULL
 109db307d85f	SELECT count() AS n FROM loom.chunks WHERE org = {org:String} AND user_id = {uid:String} AND doc_superseded_at IS NULL
@@ -427,7 +428,6 @@
 342f026b3008	SELECT count() AS n FROM loom.memory_code_link_queue WHERE org = {org:String} AND namespace = {ns:String} AND ?
 343b7c396165	SELECT count() AS n FROM loom.session_brief_revisions WHERE org = {org:String} AND namespace IN {ns:Array(String)}
 345bb4f0bdc6	SELECT count() AS n FROM loom.learnings_supporters WHERE org = {org:String} AND namespace IN {ns:Array(String)} AND ?
-345dfd79d27f	SELECT value, memory_type, confidence, promoted_from, promotion_event, promoted_from_candidate_id, promoted_by, rationale, promoted_at, reversible_until, tombstoned_at FROM loom.shared FINAL WHERE org
 348ab5a553ad	SELECT org, namespace, source_uri, chunk_idx, content, tags, doc_metadata, chunk_metadata, ingested_at, doc_superseded_at, embedding_model, embedding_dim, embedding, created_at, embed_attempts, embed_
 34912ecbbcb8	SELECT count() AS n FROM loom.memory_chunk_sources FINAL WHERE org = {org:String} AND tombstoned_at IS NULL AND (namespace, memory_key) IN {keys:Array(Tuple(String, String))}
 349d1b15dfc4	SELECT count() AS n FROM loom.dataset_rows WHERE org = {org:String} AND user_id = {uid:String}
