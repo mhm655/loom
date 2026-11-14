@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import timedelta
 from typing import Any
 
@@ -204,12 +206,11 @@ async def handle_memory_promote(input: MemoryPromoteInput) -> MemoryPromoteOutpu
         "reversible_until": reversible_until,
         "superseded_by": None,
         "tombstoned_at": None,
-        "version": next_version(),
     }
     if is_definition_promotion:
         await _insert_definition(input.org, input.namespace, names, row)
     else:
-        await shared_repo.insert_shared_row(row)
+        await shared_repo.insert_shared_row({**row, "version": next_version()})
 
     # Make the shared memory searchable via a scope='shared' embedding,
     # reusing the vector above (or a stub the embedding_worker reconciles).
@@ -310,15 +311,22 @@ async def _insert_definition(
     """Write the definition's shared row unless the namespace is at its ceiling or another
     shared definition holds one of its names, under a claim on the namespace so that two
     promotions cannot both pass."""
-    claim = f"definition.promote/{org}/{namespace}"
+    async with _definition_claim(org, namespace):
+        await _check_shared_definitions(org, namespace, names, row["memory_key"])
+        # Drawn under the claim, so of the promotions and demotes of a definition the one
+        # that ran last wins.
+        await shared_repo.insert_shared_row({**row, "version": next_version()})
+
+
+@asynccontextmanager
+async def _definition_claim(org: str, namespace: str) -> AsyncIterator[None]:
+    """The namespace's definition promotions and demotes, one at a time."""
     # The concepts page quotes the 10 s wait.
+    claim = f"definition.promote/{org}/{namespace}"
     async with leases.holding(claim, ttl_s=30, wait_s=10) as held:
         if not held:
-            raise OverloadedError("another definition promotion in this namespace is running")
-        await _check_shared_definitions(org, namespace, names, row["memory_key"])
-        # Drawn under the claim, so the row that ran last wins, and a demote that came
-        # while this one waited stays demoted.
-        await shared_repo.insert_shared_row({**row, "version": next_version()})
+            raise OverloadedError("another definition promotion or demote is running here")
+        yield
 
 
 async def _check_shared_definitions(
@@ -352,10 +360,16 @@ async def _check_shared_definitions(
 
 
 async def handle_memory_demote(input: MemoryDemoteInput) -> MemoryDemoteOutput:
+    if not input.memory_key.startswith(DEFINITION_KEY_PREFIX):
+        return await _demote(input)
+    # Under the promotions' claim, reading what a promotion before it wrote.
+    async with _definition_claim(input.org, input.namespace):
+        return await _demote(input, strong=True)
+
+
+async def _demote(input: MemoryDemoteInput, *, strong: bool = False) -> MemoryDemoteOutput:
     row = await shared_repo.fetch_shared(
-        input.org,
-        input.namespace,
-        input.memory_key,
+        input.org, input.namespace, input.memory_key, strong=strong
     )
     if row is None or row["tombstoned_at"] is not None:
         # No live shared row → idempotent no-op

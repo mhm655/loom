@@ -369,6 +369,23 @@ async def test_a_definitions_version_is_drawn_under_the_claim(store: dict[str, A
     assert row["version"] > store["claimed_at"]
 
 
+async def test_a_definitions_demote_takes_the_claim_and_reads_strongly(
+    store: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from server.memory.api.models_lifecycle import MemoryDemoteInput
+
+    seen: list[tuple[str, bool, bool]] = []
+
+    async def fetch(_org: str, _ns: str, key: str, *, strong: bool = False) -> None:
+        seen.append((key, strong, store["held"]))
+
+    monkeypatch.setattr(shared, "fetch_shared", fetch)
+    for key in (KEY, "arr_note"):
+        await promote.handle_memory_demote(MemoryDemoteInput(org="o", namespace="n", memory_key=key))
+    assert seen == [(KEY, True, True), ("arr_note", False, False)]
+    assert store["claims"] == ["definition.promote/o/n"]
+
+
 async def test_another_row_keeps_the_old_promotion_rules(store: dict[str, Any]) -> None:
     store["row"] = _row(memory_type="semantic", memory_key="arr_note", agent="bot")
     other = {"memory_key": "arr_note", "agent": "bot", "approver": "lead"}

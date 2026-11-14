@@ -99,11 +99,13 @@ async def fetch_shared(
     namespace: str,
     memory_key: str,
     *,
+    strong: bool = False,
     ch: _CHClient | None = None,
 ) -> dict[str, Any] | None:
     """Get the latest shared row for (org, ns, memory_key). FINAL
     collapses earlier promotions/demotes. Returns the row dict; the
-    caller checks `tombstoned_at` for liveness.
+    caller checks `tombstoned_at` for liveness. `strong` reads every
+    acknowledged write, a write another replica made just before included.
 
     `promoted_from_candidate_id` is NULL for the auto-promote path;
     populated by learnings.review so memory.lineage resolves the
@@ -119,7 +121,8 @@ async def fetch_shared(
         WHERE org = {org:String} AND namespace = {ns:String}
           AND memory_key = {memory_key:String}
         LIMIT 1
-        """,
+        """
+        + ("SETTINGS select_sequential_consistency = 1" if strong else ""),
         params={"org": org, "ns": namespace, "memory_key": memory_key},
     )
 

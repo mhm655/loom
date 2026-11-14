@@ -357,8 +357,9 @@ A `definition` is promoted only:
   `DEFINITION_NAME_TAKEN`, naming the keys and the names), names compared folded: format
   characters dropped, NFKC, whitespace collapsed, case-folded, then NFKC again.
 
-One namespace's definition promotions run their ceiling and name checks and the write one
-at a time (503 `OVERLOADED` when another holds the namespace past a 10 s wait). Demoting a
+One namespace's definition promotions, with their ceiling and name checks, and its
+definition demotes run one at a time, the last to run deciding whether the definition is
+shared (503 `OVERLOADED` when another holds the namespace past a 10 s wait). Demoting a
 definition gives back its name and its place. The token's actor is its `promoted_by`:
 `approver` and `promoted_from_candidate_id` are ignored and named in `ignored_args`, and
 no close shared row under another key refuses it. `learnings.review` promotes no candidate
