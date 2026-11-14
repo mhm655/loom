@@ -275,7 +275,7 @@ def _refuse_unshareable(src: MemoryRow) -> None:
     # A 'high' row is kept out of every search leg by having no vector; loom.shared has
     # no sensitivity column, so a promoted copy would be embedded and served to the
     # whole namespace. Refuse.
-    if (getattr(src, "sensitivity", "") or "") == "high":
+    if src.sensitivity == "high":
         raise HTTPException(
             status_code=422,
             detail={
@@ -406,12 +406,13 @@ async def handle_memory_demote(input: MemoryDemoteInput) -> MemoryDemoteOutput:
     # Under the promotions' claim, reading what a promotion before it wrote.
     note_budget_shape("definition")
     async with _definition_claim(input.org, input.namespace):
-        return await _demote(input, strong=True)
+        return await _demote(input, definition=True)
 
 
-async def _demote(input: MemoryDemoteInput, *, strong: bool = False) -> MemoryDemoteOutput:
+async def _demote(input: MemoryDemoteInput, *, definition: bool = False) -> MemoryDemoteOutput:
+    # A definition's reads are strong: they run under the claim, after a promotion.
     row = await shared_repo.fetch_shared(
-        input.org, input.namespace, input.memory_key, strong=strong
+        input.org, input.namespace, input.memory_key, strong=definition
     )
     if row is None or row["tombstoned_at"] is not None:
         # No live shared row → idempotent no-op
@@ -422,7 +423,7 @@ async def _demote(input: MemoryDemoteInput, *, strong: bool = False) -> MemoryDe
 
     # The tombstone's version, which the vector retire carries: above the row's whatever
     # the clock that wrote it, and for a definition above its vector's too.
-    if strong:
+    if definition:
         version = await _definition_version(input.org, input.namespace, input.memory_key, row)
     else:
         version = version_over(int(row["version"]))
@@ -434,7 +435,7 @@ async def _demote(input: MemoryDemoteInput, *, strong: bool = False) -> MemoryDe
         input.memory_key,
         now_naive,
         version=version,
-        strong=strong,
+        strong=definition,
     )
     # Tombstone via higher-version INSERT, mirroring every live column except
     # tombstoned_at + version (omitting any column zeros it for FINAL readers).

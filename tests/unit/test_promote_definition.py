@@ -76,7 +76,7 @@ def store(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         return rows[:limit]
 
     async def head(_org: str, _ns: str, key: str, *, strong: bool = False) -> Any:
-        assert strong and state["held"], "the head is read strongly under the claim"
+        assert strong == state["held"], "a definition's head is read strongly under the claim"
         return state["heads"].get(key)
 
     async def vector_head(_org: str, _ns: str, key: str) -> int:
@@ -390,15 +390,11 @@ async def test_a_definitions_demote_takes_the_claim_and_reads_strongly(
     assert store["claims"] == ["definition.promote/o/n"]
 
 
-async def test_a_cut_off_demote_sent_again_retires_the_vector_and_the_row(
-    store: dict[str, Any], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from server.memory.api.models_lifecycle import MemoryDemoteInput
-
-    ahead = promote.next_version() + 10**12
-    live = {
+def _shared_row(key: str, memory_type: str, version: int) -> dict[str, Any]:
+    """A live shared row as `fetch_shared` reads it."""
+    return {
         "value": json.dumps(VALUE),
-        "memory_type": "definition",
+        "memory_type": memory_type,
         "confidence": 1.0,
         "promoted_from": [],
         "promotion_event": "e",
@@ -408,14 +404,23 @@ async def test_a_cut_off_demote_sent_again_retires_the_vector_and_the_row(
         "promoted_at": NOW,
         "reversible_until": None,
         "tombstoned_at": None,
-        "version": ahead,
+        "version": version,
     }
-    store["heads"] = {KEY: live}
+
+
+async def test_a_cut_off_demote_sent_again_retires_the_vector_and_the_row(
+    store: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from server.memory.api.models_lifecycle import MemoryDemoteInput
+
+    ahead = promote.next_version() + 10**12
+    store["heads"] = {KEY: _shared_row(KEY, "definition", ahead)}
     steps: list[tuple[str, int]] = []
 
     async def retire(*_a: Any, version: int, strong: bool, **_k: Any) -> None:
         assert strong, "the live vectors are read strongly"
         steps.append(("vector", version))
+        store["vector_heads"][KEY] = version
 
     async def tombstone(row: dict[str, Any]) -> None:
         if len(steps) == 1:
@@ -427,11 +432,38 @@ async def test_a_cut_off_demote_sent_again_retires_the_vector_and_the_row(
     demote = MemoryDemoteInput(org="o", namespace="n", memory_key=KEY)
     with pytest.raises(ClaimExpired):
         await promote.handle_memory_demote(demote)
-    # The row is still live, so the demote sent again does both, above the row's version.
+    # The row is still live, so the demote sent again does both, above the row and above
+    # the vector the first one retired.
     out = await promote.handle_memory_demote(demote)
     assert out.demoted
+    (_, first), (_, second), (_, row) = steps
     assert [s for s, _ in steps] == ["vector", "vector", "row"]
-    assert all(v >= ahead + 2 for _, v in steps)
+    assert first >= ahead + 2 and second >= first + 2 and row == second
+
+
+async def test_another_rows_demote_retires_its_vector_first_above_its_row(
+    store: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from server.memory.api.models_lifecycle import MemoryDemoteInput
+
+    ahead = promote.next_version() + 10**12
+    store["heads"] = {"arr_note": _shared_row("arr_note", "semantic", ahead)}
+    steps: list[tuple[str, int]] = []
+
+    async def retire(*_a: Any, version: int, strong: bool, **_k: Any) -> None:
+        assert not strong
+        steps.append(("vector", version))
+
+    async def tombstone(row: dict[str, Any]) -> None:
+        steps.append(("row", row["version"]))
+
+    monkeypatch.setattr(shared, "tombstone_shared_embedding", retire)
+    monkeypatch.setattr(shared, "insert_shared_row", tombstone)
+    await promote.handle_memory_demote(
+        MemoryDemoteInput(org="o", namespace="n", memory_key="arr_note")
+    )
+    assert [s for s, _ in steps] == ["vector", "row"]
+    assert all(v >= ahead + 2 for _, v in steps) and store["claims"] == []
 
 
 async def test_another_rows_vector_shares_its_rows_version(
